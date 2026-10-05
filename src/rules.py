@@ -1,17 +1,21 @@
 """再保险合约与巨灾暴露管理领域规则与状态转换。"""
 from typing import Any, Dict, Iterable, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, PermissionDenied, ValidationError, boolean, choice, integer, number, text, text_list
 
 
 INITIAL_STATE = "quoted"
 CREATE_ROLES = {'underwriter'}
-ACTION_ROLES = {'bind': {'underwriter'}, 'submit_claim': {'claims_officer'}, 'calculate': {'claims_officer'}, 'settle': {'finance'}, 'reject': {'finance', 'claims_officer'}}
-TRANSITIONS = {'bind': {'quoted': 'bound'}, 'submit_claim': {'bound': 'claim_submitted'}, 'calculate': {'claim_submitted': 'calculated'}, 'settle': {'calculated': 'settled'}, 'reject': {'claim_submitted': 'rejected', 'calculated': 'rejected'}}
+ACTION_ROLES = {'bind': {'underwriter'}, 'submit_claim': {'claims_officer'}, 'calculate': {'claims_officer'}, 'review': {'finance'}, 'settle': {'finance'}, 'reject': {'finance', 'claims_officer'}}
+TRANSITIONS = {'bind': {'quoted': 'bound'}, 'submit_claim': {'bound': 'claim_submitted'}, 'calculate': {'claim_submitted': 'calculated'}, 'review': {'calculated': 'calculated'}, 'settle': {'calculated': 'settled'}, 'reject': {'claim_submitted': 'rejected', 'calculated': 'rejected'}}
+ASSIGN_ORG_ACTION = "assign_org"
+REVIEW_THRESHOLD = 5000000.0
 
 
 class DomainRules:
     INITIAL_STATE = INITIAL_STATE
+    ASSIGN_ORG_ACTION = ASSIGN_ORG_ACTION
+    REVIEW_THRESHOLD = REVIEW_THRESHOLD
 
     def known_role(self, role: str) -> bool:
         all_roles = set(CREATE_ROLES)
@@ -23,6 +27,10 @@ class DomainRules:
         return role == "admin" or role in CREATE_ROLES
 
     def role_can_action(self, role: str, action: str) -> bool:
+        if action == ASSIGN_ORG_ACTION:
+            return role == "admin"
+        if action == "review":
+            return role == "finance"
         return role == "admin" or role in ACTION_ROLES.get(action, set())
 
     def validate_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -67,7 +75,10 @@ class DomainRules:
             raise Conflict("当前状态不允许执行%s" % action)
         return allowed
 
-    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+    def needs_review(self, payload: Dict[str, Any]) -> bool:
+        return float(payload.get("recoverable_amount", 0)) > REVIEW_THRESHOLD
+
+    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any], actor_id: str = "") -> Tuple[str, Dict[str, Any], str]:
         new_state = self.require_transition(record, action)
         data = dict(data or {})
         p = dict(record["payload"])
@@ -79,6 +90,7 @@ class DomainRules:
         elif action == "submit_claim":
             changes["claim_number"] = text(data, "claim_number")
             changes["claim_event_id"] = text(data, "event_id")
+            changes["submitted_by"] = actor_id
             summary = "赔案已提交"
         elif action == "calculate":
             loss = number(data, "approved_loss", 0)
@@ -87,10 +99,24 @@ class DomainRules:
             changes["approved_loss"] = loss
             changes["recoverable_amount"] = round(recovery, 2)
             changes["reinstatement_premium"] = round(recovery * float(p["reinstatement_pct"]), 2)
+            changes["calculated_by"] = actor_id
             summary = "摊回金额已计算"
+        elif action == "review":
+            if p.get("reviewed_by"):
+                raise Conflict("该赔案已完成复核")
+            if actor_id and actor_id in {p.get("submitted_by"), p.get("calculated_by")}:
+                raise PermissionDenied("提交人与复核人不能为同一人")
+            changes["reviewed_by"] = actor_id
+            summary = "赔案复核通过"
         elif action == "settle":
             if float(p["recoverable_amount"]) <= 0:
                 raise ValidationError("无可结算摊回")
+            if self.needs_review(p):
+                reviewer = p.get("reviewed_by")
+                if not reviewer:
+                    raise Conflict("摊回金额超过500万元，需另一名财务复核后才能结算")
+                if actor_id and reviewer == actor_id:
+                    raise PermissionDenied("提交人与复核人不能为同一人，需另一名财务办理结算")
             changes["payment_reference"] = text(data, "payment_reference")
             summary = "摊回赔款已结算"
         elif action == "reject":

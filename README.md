@@ -26,14 +26,21 @@ python3 app.py --db ./data.db --port 8325
 
 - `GET /health`：健康检查。
 - `GET /`：演示页面。
-- `GET /api/records`：记录列表，可带`state`和`limit`参数。
-- `GET /api/records/{id}`：记录详情。
-- `GET /api/records/{id}/audit`：审计时间线。
-- `GET /api/stats`：状态统计。
-- `POST /api/records`：创建记录，请求体为`{"reference":"...","data":{...}}`。
+- `GET /api/records`：本分公司记录列表，可带`state`和`limit`参数。
+- `GET /api/records/{id}`：记录详情，仅限本分公司。
+- `GET /api/records/{id}/audit`：审计时间线，仅限本分公司。
+- `GET /api/records/pending-assignment`：归属待分配队列，仅总公司管理员。
+- `GET /api/stats`：本分公司状态统计。
+- `POST /api/records`：创建记录，请求体为`{"reference":"...","data":{...}}`，归属固定为提交人所属分公司。
 - `POST /api/records/{id}/actions/{action}`：执行业务动作，请求体为`{"expected_version":1,"data":{...}}`。
 
-除`/health`和`/`外，请求需提供`X-User-Id`、`X-Role`，可选`X-Org`。
+## 身份与权限
+
+- 请求只需提供`X-User-Id`；角色与分公司由服务端身份目录（`users`表）解析，客户端改请求头无法越权，未登记身份直接拒绝。
+- 列表、详情、审计、统计和动作均按分公司隔离，跨分公司读写返回403；总公司管理员（`admin`）可跨分公司。
+- 摊回金额超过500万元时，`settle`前必须由财务执行`review`复核，结算提交人与复核人不能同号；两人同时提交以版本号为准，先到者成功，后到者收到409版本冲突。
+- 旧数据缺少分公司归属时自动进入待分配队列，仅总公司管理员可通过`assign_org`动作逐案补全（`data`为`{"org":"华东分公司"}`），补全前不能核定（`calculate`）或结算（`settle`）。
+- 内置演示用户：`demo-admin`（总公司管理员）、`demo-underwriter`、`demo-claims`、`demo-finance`、`demo-finance-2`（均为华东分公司）。
 
 ## 测试
 
@@ -41,4 +48,4 @@ python3 app.py --db ./data.db --port 8325
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖完整流程、规则计算、重复引用、权限拒绝和版本冲突。
+测试覆盖完整流程、规则计算、重复引用、权限拒绝、版本冲突、分公司隔离、超限复核和旧数据待分配补全。

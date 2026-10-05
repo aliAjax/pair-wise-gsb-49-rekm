@@ -4,11 +4,20 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .domain import Conflict, NotFound
+from .domain import Conflict, NotFound, ValidationError
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+SEED_USERS = (
+    ("demo-admin", "admin", "总部"),
+    ("demo-underwriter", "underwriter", "华东分公司"),
+    ("demo-claims", "claims_officer", "华东分公司"),
+    ("demo-finance", "finance", "华东分公司"),
+    ("demo-finance-2", "finance", "华东分公司"),
+)
 
 
 class Repository:
@@ -32,6 +41,7 @@ class Repository:
                     reference TEXT NOT NULL UNIQUE,
                     state TEXT NOT NULL,
                     version INTEGER NOT NULL DEFAULT 1,
+                    org TEXT,
                     payload TEXT NOT NULL,
                     created_by TEXT NOT NULL,
                     updated_by TEXT NOT NULL,
@@ -47,10 +57,21 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    org TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
                 """
             )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(records)")}
+            if "org" not in columns:
+                # 旧库迁移：历史赔案org为NULL，自动进入待分配队列
+                connection.execute("ALTER TABLE records ADD COLUMN org TEXT")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_records_org ON records(org)")
+            connection.executemany("INSERT OR IGNORE INTO users(user_id,role,org) VALUES(?,?,?)", SEED_USERS)
 
     @staticmethod
     def _row(row: sqlite3.Row) -> Dict[str, Any]:
@@ -58,18 +79,30 @@ class Repository:
         item["payload"] = json.loads(item["payload"])
         return item
 
-    def create(self, reference: str, state: str, payload: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
+    def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT user_id, role, org FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def upsert_user(self, user_id: str, role: str, org: str) -> None:
+        user_id, role, org = user_id.strip(), role.strip(), org.strip()
+        if not user_id or not role or not org:
+            raise ValidationError("用户标识、角色和分公司不能为空")
+        with self._connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO users(user_id,role,org) VALUES(?,?,?)", (user_id, role, org))
+
+    def create(self, reference: str, state: str, payload: Dict[str, Any], actor_id: str, org: str) -> Dict[str, Any]:
         now = _now()
         try:
             with self._connect() as connection:
                 cursor = connection.execute(
-                    "INSERT INTO records(reference,state,version,payload,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (reference, state, 1, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, actor_id, now, now),
+                    "INSERT INTO records(reference,state,version,org,payload,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (reference, state, 1, org, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, actor_id, now, now),
                 )
                 record_id = int(cursor.lastrowid)
                 connection.execute(
                     "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
-                    (record_id, "created", actor_id, 1, json.dumps({"state": state}, ensure_ascii=False, sort_keys=True), now),
+                    (record_id, "created", actor_id, 1, json.dumps({"state": state, "org": org}, ensure_ascii=False, sort_keys=True), now),
                 )
                 row = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
         except sqlite3.IntegrityError as exc:
@@ -83,13 +116,26 @@ class Repository:
             raise NotFound("记录不存在")
         return self._row(row)
 
-    def list_records(self, state: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_records(self, state: Optional[str] = None, limit: int = 100, org: Optional[str] = None) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        clauses: List[str] = []
+        params: List[Any] = []
+        if state:
+            clauses.append("state=?")
+            params.append(state)
+        if org is not None:
+            clauses.append("org=?")
+            params.append(org)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM records" + where + " ORDER BY id DESC LIMIT ?", params).fetchall()
+        return [self._row(row) for row in rows]
+
+    def list_unassigned(self, limit: int = 100) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
         with self._connect() as connection:
-            if state:
-                rows = connection.execute("SELECT * FROM records WHERE state=? ORDER BY id DESC LIMIT ?", (state, limit)).fetchall()
-            else:
-                rows = connection.execute("SELECT * FROM records ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = connection.execute("SELECT * FROM records WHERE org IS NULL OR org='' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [self._row(row) for row in rows]
 
     def mutate(self, record_id: int, expected_version: int, state: str, payload: Dict[str, Any], actor_id: str, action: str, details: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,6 +162,33 @@ class Repository:
             connection.commit()
         return self._row(result)
 
+    def assign_org(self, record_id: int, expected_version: int, org: str, actor_id: str) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT version, org, state FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            if row["org"]:
+                connection.rollback()
+                raise Conflict("赔案已归属分公司，不能重复补全")
+            version = int(expected_version) + 1
+            connection.execute(
+                "UPDATE records SET org=?,version=?,updated_by=?,updated_at=? WHERE id=?",
+                (org, version, actor_id, now, record_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, "assign_org", actor_id, version, json.dumps({"summary": "分公司归属已补全", "org": org}, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            connection.commit()
+        return self._row(result)
+
     def add_audit(self, record_id: int, actor_id: str, action: str, details: Dict[str, Any]) -> None:
         with self._connect() as connection:
             row = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()
@@ -137,9 +210,12 @@ class Repository:
             result.append(item)
         return result
 
-    def stats(self) -> Dict[str, int]:
+    def stats(self, org: Optional[str] = None) -> Dict[str, int]:
         with self._connect() as connection:
-            rows = connection.execute("SELECT state, COUNT(*) AS total FROM records GROUP BY state").fetchall()
+            if org is None:
+                rows = connection.execute("SELECT state, COUNT(*) AS total FROM records GROUP BY state").fetchall()
+            else:
+                rows = connection.execute("SELECT state, COUNT(*) AS total FROM records WHERE org=? GROUP BY state", (org,)).fetchall()
         return {str(row["state"]): int(row["total"]) for row in rows}
 
     def health(self) -> bool:

@@ -22,11 +22,11 @@ def make_handler(service: Any, static_dir: Path):
             return
 
         def _actor(self) -> Actor:
+            # 请求头只提供用户标识，角色与分公司由服务端身份目录解析，防止改头越权
             user_id = self.headers.get("X-User-Id", "").strip()
-            role = self.headers.get("X-Role", "").strip()
-            if not user_id or not role:
-                raise PermissionDenied("缺少X-User-Id或X-Role")
-            return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
+            if not user_id:
+                raise PermissionDenied("缺少X-User-Id")
+            return Actor(user_id=user_id, role="", organization="")
 
         def _body(self) -> Dict[str, Any]:
             try:
@@ -75,6 +75,9 @@ def make_handler(service: Any, static_dir: Path):
                     query = parse_qs(parsed.query)
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
                     self._send(200, {"items": records})
+                    return
+                if parsed.path == "/api/records/pending-assignment":
+                    self._send(200, {"items": service.pending_assignments(self._actor())})
                     return
                 match = RECORD_RE.match(parsed.path)
                 if match:
