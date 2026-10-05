@@ -20,15 +20,15 @@ class FailureTest(unittest.TestCase):
 
     def test_permission_and_duplicate(self):
         with self.assertRaises(PermissionDenied):
-            self.service.create(Actor("outsider", "outsider"), "RI-25001", CREATE_DATA)
-        self.service.create(Actor("creator", "underwriter"), "RI-25001", CREATE_DATA)
+            self.service.create(Actor("outsider", "outsider", "east"), "RI-25001", CREATE_DATA)
+        self.service.create(Actor("creator", "underwriter", "east"), "RI-25001", CREATE_DATA)
         with self.assertRaises(Conflict):
-            self.service.create(Actor("creator", "underwriter"), "RI-25001", CREATE_DATA)
+            self.service.create(Actor("creator", "underwriter", "east"), "RI-25001", CREATE_DATA)
 
     def test_stale_version_is_rejected(self):
-        record = self.service.create(Actor("creator", "underwriter"), "RI-25001", CREATE_DATA)
+        record = self.service.create(Actor("creator", "underwriter", "east"), "RI-25001", CREATE_DATA)
         first = FLOW[0]
-        record = self.service.act(Actor("operator", first[1]), record["id"], record["version"], first[0], first[2])
+        record = self.service.act(Actor("operator", first[1], "east"), record["id"], record["version"], first[0], first[2])
         second = FLOW[1]
         with self.assertRaises(Conflict):
-            self.service.act(Actor("operator", second[1]), record["id"], record["version"] - 1, second[0], second[2])
+            self.service.act(Actor("operator", second[1], "east"), record["id"], record["version"] - 1, second[0], second[2])

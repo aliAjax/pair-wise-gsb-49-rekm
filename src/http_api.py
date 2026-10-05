@@ -6,27 +6,29 @@ from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
 
-from .domain import Actor, DomainError, PermissionDenied, ValidationError
+from .domain import DomainError, PermissionDenied, ValidationError
 
 
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+ASSIGN_RE = re.compile(r"^/api/records/(\d+)/assign$")
 
 
-def make_handler(service: Any, static_dir: Path):
+def make_handler(service: Any, static_dir: Path, directory: Any):
     class Handler(BaseHTTPRequestHandler):
         server_version = "reinsurance-exposure/1.0"
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
 
-        def _actor(self) -> Actor:
+        def _actor(self):
+            # 只接受用户标识，角色与分公司归属由服务端目录解析，
+            # 客户端无法通过伪造X-Role/X-Org请求头越权。
             user_id = self.headers.get("X-User-Id", "").strip()
-            role = self.headers.get("X-Role", "").strip()
-            if not user_id or not role:
-                raise PermissionDenied("缺少X-User-Id或X-Role")
-            return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
+            if not user_id:
+                raise PermissionDenied("缺少X-User-Id")
+            return directory.resolve(user_id)
 
         def _body(self) -> Dict[str, Any]:
             try:
@@ -76,6 +78,11 @@ def make_handler(service: Any, static_dir: Path):
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
                     self._send(200, {"items": records})
                     return
+                if parsed.path == "/api/pending-assignments":
+                    query = parse_qs(parsed.query)
+                    items = service.pending_assignments(self._actor(), limit=int(query.get("limit", ["100"])[0]))
+                    self._send(200, {"items": items})
+                    return
                 match = RECORD_RE.match(parsed.path)
                 if match:
                     self._send(200, service.get_record(self._actor(), int(match.group(1))))
@@ -107,6 +114,14 @@ def make_handler(service: Any, static_dir: Path):
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
                     return
+                match = ASSIGN_RE.match(parsed.path)
+                if match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    record = service.assign_org(self._actor(), int(match.group(1)), body.get("org", ""), version)
+                    self._send(200, record)
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -114,5 +129,5 @@ def make_handler(service: Any, static_dir: Path):
     return Handler
 
 
-def create_server(host: str, port: int, service: Any, static_dir: Path) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(service, static_dir))
+def create_server(host: str, port: int, service: Any, static_dir: Path, directory: Any) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(service, static_dir, directory))

@@ -28,6 +28,10 @@ class PermissionDenied(DomainError):
     code = "permission_denied"
 
 
+HQ_ORG = "HQ"
+UNASSIGNED_ORG = ""
+
+
 @dataclass(frozen=True)
 class Actor:
     user_id: str

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src.audit import AuditRecorder
 from src.http_api import create_server
+from src.identity import UserDirectory
 from src.repository import Repository
 from src.rules import DomainRules
 from src.service import Service
@@ -25,6 +26,7 @@ def parse_args():
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite数据库路径")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP监听端口")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址")
+    parser.add_argument("--users", default=None, help="用户目录JSON文件路径，缺省使用内置演示目录")
     return parser.parse_args()
 
 
@@ -32,7 +34,8 @@ def main() -> None:
     args = parse_args()
     Path(args.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     service = build_service(args.db)
-    server = create_server(args.host, args.port, service, BASE_DIR / "static")
+    directory = UserDirectory.load(args.users) if args.users else UserDirectory()
+    server = create_server(args.host, args.port, service, BASE_DIR / "static", directory)
     print("再保险合约与巨灾暴露管理 listening on http://%s:%s" % (args.host, args.port), flush=True)
     try:
         server.serve_forever()

@@ -19,11 +19,12 @@ class WorkflowTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_complete_workflow_and_audit(self):
-        record = self.service.create(Actor("creator", "underwriter"), "RI-25001", CREATE_DATA)
+        record = self.service.create(Actor("creator", "underwriter", "east"), "RI-25001", CREATE_DATA)
         self.assertEqual(record["state"], "quoted")
+        self.assertEqual(record["org"], "east")
         for action, role, data, expected_state in FLOW:
-            record = self.service.act(Actor("operator", role), record["id"], record["version"], action, data)
+            record = self.service.act(Actor("operator", role, "east"), record["id"], record["version"], action, data)
             self.assertEqual(record["state"], expected_state)
-        timeline = self.service.timeline(Actor("creator", "underwriter"), record["id"])
+        timeline = self.service.timeline(Actor("creator", "underwriter", "east"), record["id"])
         self.assertEqual(len(timeline), len(FLOW) + 1)
         self.assertEqual(timeline[-1]["action"], FLOW[-1][0])
